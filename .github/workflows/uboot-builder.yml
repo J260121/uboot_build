@@ -1,0 +1,172 @@
+name: 798x-UBOOT
+
+on:
+  #自动编译：每周日早上4点
+  schedule:
+    - cron: 0 2 * * 1
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: '是否发布为预发布版本 (Pre-release)'
+        required: false
+        type: boolean
+        default: false
+      branch:
+        description: '选择分支进行编译'
+        required: false
+        type: string
+        default: 'master'
+
+env:
+  GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+  WRT_REPO: https://github.com/J260121/mt798x-dhcpd-By_Yu.git
+  WRT_BRANCH: ${{ github.event.inputs.branch }}
+  PRERELEASE: ${{ github.event.inputs.prerelease }}
+  #https://github.com/weekdaycare/bl-mt798x-dhcpd
+permissions: write-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq purge firefox
+          sudo -E apt -yqq update
+          sudo -E apt -yqq full-upgrade
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E apt -yqq install dos2unix bison build-essential device-tree-compiler flex gcc-aarch64-linux-gnu libssl-dev qemu-user-static
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown $USER:$USER /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt $GITHUB_WORKSPACE/wrt
+
+      - name: Clone Code
+        run: |
+          git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
+
+      - name: Compile Prepare
+        run: |
+          sed -i "5s/UBOOT_DIR=.*/UBOOT_DIR=${{matrix.WRT_MTK}}/" ./wrt/build.sh
+          sed -i "7s/ATF_DIR=.*/ATF_DIR=${{matrix.WRT_ATF}}/" ./wrt/build.sh
+
+          declare -A lines_map
+          while IFS= read -r f; do
+            [[ $(basename "$f") =~ ^(mt798[1])_(.*)_defconfig$ ]] || continue
+            soc="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            if [[ $rest == *_multi_layout ]]; then
+              lines_map["$rest"]="SOC=$soc BOARD=$rest MULTI_LAYOUT=1 VERSION=2025 ./build.sh"
+            else
+              lines_map["$rest"]="SOC=$soc BOARD=$rest MULTI_LAYOUT=0 VERSION=2025 ./build.sh"
+            fi
+          done < <(find ./wrt/uboot-mtk-*/configs -type f -name 'mt798*defconfig' | grep -iE 'mt798[1]_cudy' | grep -ivE 'rfb|fpga')
+
+          printf "%s\n" "${lines_map[@]}" | sort > ./Uboots.txt
+          sed -i 's/_multi_layout//' ./Uboots.txt
+          cat ./Uboots.txt
+
+          for soc in 7981 7986; do
+            boards=$(awk -v s="SOC=mt$soc" '$0 ~ s {
+              for (i=1; i<=NF; i++) if ($i ~ /^BOARD=/) {
+                split($i, a, "="); print toupper(a[2]);
+              }
+            }' ./Uboots.txt | sort -u | xargs)
+            eval "TYPE_$soc=\"$boards\""
+          done
+
+          mv -f Uboots.txt Uboots.sh
+          find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
+
+          echo "WRT_TYPE_7981=$TYPE_7981" >> $GITHUB_ENV
+          echo "WRT_TYPE_7986=$TYPE_7986" >> $GITHUB_ENV
+
+      - name: Compile Uboot
+        run: |
+          cd ./wrt/
+
+          $GITHUB_WORKSPACE/Uboots.sh
+
+      - name: Machine Information
+        run: |
+          cd ./wrt/
+
+          echo "======================="
+          lscpu | grep -E "name|Core|Thread"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h --max-depth=1
+          echo "======================="
+          
+
+      - name: Package Uboot
+        run: |
+          cd ./wrt/ && mkdir ./upload/
+          WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d")
+          for FILE in $(find ./output/ -type f -iname "*.*") ; do
+            EXT=$(basename $FILE | cut -d '.' -f 2-)
+            NAME=$(basename $FILE | cut -d '.' -f 1)
+            NEW_FILE="$NAME"."$EXT"
+            mv -f $FILE ./upload/$NEW_FILE
+          done
+
+          zip -r ./upload/mt798X-Uboot_"$WRT_DATE".zip ./upload/*.*
+
+            
+      - name: Generate release tag
+        id: tag
+        run: |
+          BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          RELEASE_TAG="Uboot-${BUILD_TIME}"
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+
+          # 生成 release 信息
+          cat > release.txt << EOF
+          ## 📦 Uboot Firmware Release
+
+          **🏷️ Release:** $RELEASE_TAG
+          **📦 Repo:** $WRT_REPO
+          **🌿 Branch:** $WRT_BRANCH
+          **📱 ATF:** atf-20250711
+          **📱 MTK:** uboot-mtk-20250711
+          **📱 Device:** cudy_tr3000 128M/256M
+          **📅 Build Date:** $BUILD_TIME
+
+          ## 📥 Download
+
+          Download the firmware files from the assets below.
+
+          ## 🚧 Notice
+
+          该固件为 DHCP uboot
+
+          EOF
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.status == 'success' && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          prerelease: ${{ env.PRERELEASE == 'true' }}
+          files: ./wrt/upload/*.bin
+
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 0
+          keep_minimum_runs: 5
